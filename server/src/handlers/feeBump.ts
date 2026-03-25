@@ -3,6 +3,7 @@ import StellarSdk from "@stellar/stellar-sdk";
 import { Config } from "../config";
 
 import { FeeBumpSchema, FeeBumpRequest } from "../schemas/feeBump";
+import { calculateFeeBumpFee } from "../utils/feeCalculator";
 
 interface FeeBumpResponse {
   xdr: string;
@@ -13,13 +14,16 @@ interface FeeBumpResponse {
 export function feeBumpHandler(
   req: Request,
   res: Response,
-  config: Config
+  config: Config,
 ): void {
   try {
     const result = FeeBumpSchema.safeParse(req.body);
 
     if (!result.success) {
-      console.warn("Validation failed for fee-bump request:", result.error.format());
+      console.warn(
+        "Validation failed for fee-bump request:",
+        result.error.format(),
+      );
       res.status(400).json({
         error: "Validation failed",
         details: result.error.format(),
@@ -32,10 +36,11 @@ export function feeBumpHandler(
     console.log("Received fee-bump request");
 
     let innerTransaction: any;
+
     try {
       innerTransaction = StellarSdk.TransactionBuilder.fromXDR(
         body.xdr,
-        config.networkPassphrase
+        config.networkPassphrase,
       );
     } catch (error: any) {
       console.error("Failed to parse XDR:", error.message);
@@ -46,31 +51,50 @@ export function feeBumpHandler(
     }
 
     // Verify inner transaction is signed
-    if (innerTransaction.signatures.length === 0) {
+    if (
+      !innerTransaction.signatures ||
+      innerTransaction.signatures.length === 0
+    ) {
       res.status(400).json({
         error: "Inner transaction must be signed before fee-bumping",
       });
       return;
     }
 
-    if ('feeBumpTransaction' in innerTransaction) {
+    // Prevent fee-bumping an already fee-bumped transaction
+    if ("feeBumpTransaction" in innerTransaction) {
       res.status(400).json({
         error: "Cannot fee-bump an already fee-bumped transaction",
       });
       return;
     }
 
-    const feeAmount = Math.floor(config.baseFee * config.feeMultiplier);
+    // Extract operation count safely
+    const operationCount = innerTransaction.operations?.length || 0;
+
+    // Use extracted utility for correct fee calculation
+    const feeAmount = calculateFeeBumpFee(
+      operationCount,
+      config.baseFee,
+      config.feeMultiplier,
+    );
+
+    console.log("Fee calculation:", {
+      operationCount,
+      baseFee: config.baseFee,
+      multiplier: config.feeMultiplier,
+      finalFee: feeAmount,
+    });
 
     const feePayerKeypair = StellarSdk.Keypair.fromSecret(
-      config.feePayerSecret
+      config.feePayerSecret,
     );
 
     const feeBumpTx = StellarSdk.TransactionBuilder.buildFeeBumpTransaction(
       feePayerKeypair,
       feeAmount,
       innerTransaction,
-      config.networkPassphrase
+      config.networkPassphrase,
     );
 
     feeBumpTx.sign(feePayerKeypair);
@@ -84,6 +108,7 @@ export function feeBumpHandler(
 
     if (submit && config.horizonUrl) {
       const server = new StellarSdk.Horizon.Server(config.horizonUrl);
+
       server
         .submitTransaction(feeBumpTx)
         .then((result: any) => {
@@ -96,6 +121,7 @@ export function feeBumpHandler(
         })
         .catch((error: any) => {
           console.error("Transaction submission failed:", error);
+
           res.status(500).json({
             error: `Transaction submission failed: ${error.message}`,
             xdr: feeBumpXdr,
@@ -107,10 +133,12 @@ export function feeBumpHandler(
         xdr: feeBumpXdr,
         status,
       };
+
       res.json(response);
     }
   } catch (error: any) {
     console.error("Error processing fee-bump request:", error);
+
     res.status(500).json({
       error: `Internal server error: ${error.message}`,
     });
